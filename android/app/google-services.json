@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "776429497842",
+    "project_id": "stockpredicitonsss-ba355",
+    "storage_bucket": "stockpredicitonsss-ba355.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:776429497842:android:63a4752d3041fd610c4f6b",
+        "android_client_info": {
+          "package_name": "com.example.stockpredicitonsss"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDnQu5rwFHHR0Af1FDnhSvapw1mnd8_Fnk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
