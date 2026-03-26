@@ -20,6 +20,9 @@ migrate_working_dir/
 *.iws
 .idea/
 
+*.zip
+*.zip.zip
+
 # VS Code
 #.vscode/
 
