@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 
@@ -50,6 +51,7 @@ class StockSentimentAnalysis {
 
   final bool isFallbackPrediction;
   final bool usingSampleMentions;
+  final bool insufficientNews;
   final bool historicalPricesSynced;
   final double? correlationUsed;
 
@@ -62,13 +64,25 @@ class StockSentimentAnalysis {
     this.isDemo = false,
     this.isFallbackPrediction = false,
     this.usingSampleMentions = false,
+    this.insufficientNews = false,
     this.historicalPricesSynced = false,
     this.correlationUsed,
   });
 }
 
 class SentimentPredictionService {
-  String? get baseUrl => dotenv.env['SENTIMENT_API_BASE_URL']?.trim();
+  /// Last failure reason when live API call fails (for UI hints).
+  static String? lastFetchError;
+
+  /// Supports `SENTIMENT_API_BASE_URL` or common typo `SENTIMENT_API_URL`.
+  String? get baseUrl {
+    final raw = dotenv.env['SENTIMENT_API_BASE_URL']?.trim() ??
+        dotenv.env['SENTIMENT_API_URL']?.trim();
+    if (raw == null || raw.isEmpty) return null;
+    // Avoid "//analysis" if user adds trailing slash
+    return raw.endsWith('/') ? raw.substring(0, raw.length - 1) : raw;
+  }
+
   bool get isConfigured => baseUrl != null && baseUrl!.isNotEmpty;
 
   Future<StockSentimentAnalysis?> getAnalysisForSymbol({
@@ -76,29 +90,52 @@ class SentimentPredictionService {
     required double currentPrice,
     double? fallbackPrice,
   }) async {
+    lastFetchError = null;
     final price = currentPrice > 0 ? currentPrice : (fallbackPrice ?? 0);
-    if (!isConfigured) return null;
-    if (price <= 0) return null;
+    if (!isConfigured) {
+      lastFetchError =
+          'SENTIMENT_API_BASE_URL is missing in .env (add e.g. http://10.0.2.2:5000 for Android emulator)';
+      return null;
+    }
+    if (price <= 0) {
+      lastFetchError = 'No current price for sentiment request';
+      return null;
+    }
 
     try {
-      final uri = Uri.parse('$baseUrl/analysis/$symbol').replace(
+      final uri = Uri.parse('${baseUrl!}/analysis/$symbol').replace(
         queryParameters: {'current_price': price.toStringAsFixed(2)},
       );
 
-      final response = await http
-          .get(uri)
-          .timeout(
-        const Duration(seconds: 10),
-        onTimeout: () => throw Exception('timeout'),
+      if (kDebugMode) {
+        debugPrint('[SentimentAPI] GET $uri');
+      }
+
+      final response = await http.get(uri).timeout(
+        const Duration(seconds: 15),
+        onTimeout: () => throw Exception(
+          'Timeout after 15s — is Flask running? Can emulator reach ${baseUrl!}?',
+        ),
       );
 
-      if (response.statusCode != 200) return null;
+      if (response.statusCode != 200) {
+        lastFetchError =
+            'HTTP ${response.statusCode}: ${response.body.length > 120 ? response.body.substring(0, 120) : response.body}';
+        return null;
+      }
 
       final map = jsonDecode(response.body) as Map<String, dynamic>;
-      if (map.containsKey('error')) return null;
+      if (map.containsKey('error')) {
+        lastFetchError = map['error']?.toString();
+        return null;
+      }
 
       return _parseResponse(symbol, map);
-    } catch (_) {
+    } catch (e, st) {
+      lastFetchError = e.toString();
+      if (kDebugMode) {
+        debugPrint('[SentimentAPI] error: $e\n$st');
+      }
       return null;
     }
   }
@@ -111,10 +148,8 @@ class SentimentPredictionService {
     final p = currentPrice > 0 ? currentPrice : defaultPriceForSymbol(sym);
 
     final platforms = [
-      PlatformSentiment(platform: 'Reddit', sentiment: 58, reliability: 52),
-      PlatformSentiment(platform: 'Twitter', sentiment: 62, reliability: 58),
-      PlatformSentiment(platform: 'News', sentiment: 71, reliability: 85),
-      PlatformSentiment(platform: 'StockTwits', sentiment: 55, reliability: 52),
+      PlatformSentiment(platform: 'CNBC', sentiment: 61, reliability: 82),
+      PlatformSentiment(platform: 'Bloomberg', sentiment: 64, reliability: 88),
     ];
 
     final intervals = PredictionInterval.values;
@@ -137,7 +172,8 @@ class SentimentPredictionService {
       predictions: predictions,
       isDemo: true,
       isFallbackPrediction: true,
-      usingSampleMentions: true,
+      usingSampleMentions: false,
+      insufficientNews: false,
       historicalPricesSynced: false,
       correlationUsed: null,
     );
@@ -217,6 +253,7 @@ class SentimentPredictionService {
       predictions: predMap,
       isFallbackPrediction: map['is_fallback_prediction'] == true,
       usingSampleMentions: map['using_sample_mentions'] == true,
+      insufficientNews: map['insufficient_news'] == true,
       historicalPricesSynced: map['historical_prices_synced'] == true,
       correlationUsed: correlation,
     );

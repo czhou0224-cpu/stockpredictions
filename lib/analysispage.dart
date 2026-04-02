@@ -29,6 +29,14 @@ class _AnalysispageState extends State<Analysispage> {
     _loadAnalysis();
   }
 
+  String _sentimentApiHelpText() {
+    final err = SentimentPredictionService.lastFetchError;
+    const base =
+        "Live API unreachable (showing demo). Android emulator: SENTIMENT_API_BASE_URL=http://10.0.2.2:5000 in .env; physical phone: use your PC LAN IP. Restart app after .env changes. ";
+    if (err == null || err.isEmpty) return base;
+    return "$base\nDetail: $err";
+  }
+
   Future<void> _loadAnalysis() async {
     setState(() => _loading = true);
 
@@ -316,9 +324,9 @@ class _AnalysispageState extends State<Analysispage> {
                                 "Fallback prediction",
                                 Colors.amber,
                               ),
-                            if (_analysis!.usingSampleMentions)
+                            if (_analysis!.insufficientNews && !_analysis!.isDemo)
                               _statusChip(
-                                "Sample social mentions",
+                                "No CNBC/Bloomberg headlines found",
                                 Colors.orange,
                               ),
                             if (_analysis!.historicalPricesSynced)
@@ -451,23 +459,23 @@ class _AnalysispageState extends State<Analysispage> {
                         ],
                       ),
                       if (_analysis != null && _analysis!.isDemo)
-                        const Padding(
-                          padding: EdgeInsets.only(top: 8),
+                        Padding(
+                          padding: const EdgeInsets.only(top: 8),
                           child: Text(
-                            "Can't reach sentiment API. Android emulator: set SENTIMENT_API_BASE_URL=http://10.0.2.2:5000 in .env, then restart app.",
-                            style: TextStyle(
+                            _sentimentApiHelpText(),
+                            style: const TextStyle(
                               fontSize: 11,
                               color: Colors.white38,
                             ),
                           ),
                         ),
                       if (_analysis != null &&
-                          _analysis!.usingSampleMentions &&
+                          _analysis!.insufficientNews &&
                           !_analysis!.isDemo)
                         const Padding(
                           padding: EdgeInsets.only(top: 8),
                           child: Text(
-                            "Sentiment is still based on sample placeholder mentions from the backend, not live Reddit/Twitter/News/StockTwits APIs.",
+                            "No headlines were returned from CNBC/Bloomberg RSS (Google News + feeds). Try again later or check server logs.",
                             style: TextStyle(
                               fontSize: 11,
                               color: Colors.orangeAccent,
@@ -491,7 +499,7 @@ class _AnalysispageState extends State<Analysispage> {
                         Padding(
                           padding: const EdgeInsets.only(top: 12),
                           child: Text(
-                            "Set SENTIMENT_API_BASE_URL in .env and run the sentiment API for predictions based on social sentiment + ML.",
+                            "Set SENTIMENT_API_BASE_URL in .env and run the sentiment API for predictions based on CNBC + Bloomberg news sentiment.",
                             style: TextStyle(
                               fontSize: 12,
                               color: Colors.orange.shade200,
@@ -514,7 +522,7 @@ class _AnalysispageState extends State<Analysispage> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       const Text(
-                        "Social Sentiment",
+                        "News Sentiment",
                         style: TextStyle(
                           color: Colors.white,
                           fontWeight: FontWeight.bold,
@@ -555,7 +563,7 @@ class _AnalysispageState extends State<Analysispage> {
                                 vertical: 12,
                               ),
                               child: Text(
-                                "Platform sentiment from sentiment API (NLP on social mentions).",
+                                "Platform sentiment from news API (NLP on CNBC + Bloomberg).",
                                 style: TextStyle(
                                   fontSize: 12,
                                   color: Colors.white54,

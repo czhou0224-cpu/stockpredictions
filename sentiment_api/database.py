@@ -85,6 +85,34 @@ def get_sentiment_history(symbol: str, days: int = 90) -> List[Tuple[str, str, f
     return rows
 
 
+def get_price_dates_without_sentiment(
+    symbol: str, lookback_days: int = 90, limit: int = 20
+) -> List[str]:
+    """
+    Trading dates we have in price_history but no sentiment row yet (catch-up backfill).
+    Oldest first so repeated requests gradually fill history toward today.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    since = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    cur.execute(
+        """
+        SELECT p.date FROM price_history p
+        WHERE p.symbol = ? AND p.date >= ?
+        AND NOT EXISTS (
+            SELECT 1 FROM sentiment_history s
+            WHERE s.symbol = p.symbol AND s.date = p.date
+        )
+        ORDER BY p.date ASC
+        LIMIT ?
+        """,
+        (symbol.upper(), since, limit),
+    )
+    rows = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
 def get_price_history(symbol: str, days: int = 90) -> List[Tuple[str, float]]:
     """Returns list of (date, close_price)."""
     conn = get_conn()
