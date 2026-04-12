@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-# Load project root .env (parent of sentiment_api/) so ALPHAVANTAGE_API_KEY works when running from sentiment_api/
+# Load project root .env (parent of sentiment_api/) so FINNHUB_API_KEY works when running from sentiment_api/
 _root = Path(__file__).resolve().parent.parent
 load_dotenv(_root / ".env")
 load_dotenv()

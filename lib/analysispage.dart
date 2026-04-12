@@ -1,9 +1,16 @@
 import 'package:flutter/material.dart';
-import 'alpha_vantage_service.dart';
+import 'finnhub_service.dart';
 import 'sentiment_prediction_service.dart';
 
 class Analysispage extends StatefulWidget {
-  const Analysispage({super.key});
+  const Analysispage({
+    super.key,
+    this.initialSymbol = 'TSLA',
+    this.initialDisplayName = 'Tesla',
+  });
+
+  final String initialSymbol;
+  final String initialDisplayName;
 
   @override
   State<Analysispage> createState() => _AnalysispageState();
@@ -11,22 +18,40 @@ class Analysispage extends StatefulWidget {
 
 class _AnalysispageState extends State<Analysispage> {
   bool searching = false;
-  String _stockSymbol = 'TSLA';
-  String _stockDisplayName = 'Tesla';
+  late String _stockSymbol;
+  late String _stockDisplayName;
   PredictionInterval? _selectedInterval;
   StockSentimentAnalysis? _analysis;
   QuoteResult? _quote;
   bool _loading = true;
 
-  final AlphaVantageService _alphaVantage = AlphaVantageService();
+  final FinnhubService _finnhub = FinnhubService();
   final SentimentPredictionService _sentimentService =
   SentimentPredictionService();
 
   @override
   void initState() {
     super.initState();
+    _stockSymbol = widget.initialSymbol.toUpperCase().trim();
+    _stockDisplayName = widget.initialDisplayName.trim().isEmpty
+        ? _stockSymbol
+        : widget.initialDisplayName.trim();
     _selectedInterval = PredictionInterval.oneDay;
     _loadAnalysis();
+  }
+
+  @override
+  void didUpdateWidget(covariant Analysispage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final sym = widget.initialSymbol.toUpperCase().trim();
+    final name = widget.initialDisplayName.trim().isEmpty
+        ? sym
+        : widget.initialDisplayName.trim();
+    if (sym != _stockSymbol || name != _stockDisplayName) {
+      _stockSymbol = sym;
+      _stockDisplayName = name;
+      _loadAnalysis();
+    }
   }
 
   String _sentimentApiHelpText() {
@@ -42,11 +67,11 @@ class _AnalysispageState extends State<Analysispage> {
 
     try {
       QuoteResult? quote =
-      await _alphaVantage.fetchQuoteWithPreviousClose(_stockSymbol);
+      await _finnhub.fetchQuoteWithPreviousClose(_stockSymbol);
 
       if (quote == null) {
         await Future.delayed(const Duration(milliseconds: 1500));
-        quote = await _alphaVantage.fetchQuoteWithPreviousClose(_stockSymbol);
+        quote = await _finnhub.fetchQuoteWithPreviousClose(_stockSymbol);
       }
 
       final price = quote?.price ?? 0.0;
@@ -253,6 +278,17 @@ class _AnalysispageState extends State<Analysispage> {
                   fontSize: 38,
                   fontWeight: FontWeight.w900,
                   color: Colors.white,
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  _stockSymbol,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    color: Colors.white54,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
               Container(

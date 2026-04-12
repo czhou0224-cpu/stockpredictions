@@ -3,7 +3,7 @@ import 'package:carousel_slider/carousel_slider.dart';
 import 'package:stockpredicitonsss/analysispage.dart';
 import 'package:stockpredicitonsss/profilepage.dart';
 import 'port.dart';
-import 'alpha_vantage_service.dart';
+import 'finnhub_service.dart';
 
 class Homepage extends StatefulWidget {
   const Homepage({super.key});
@@ -14,13 +14,18 @@ class Homepage extends StatefulWidget {
 
 class _HomepageState extends State<Homepage> {
   int _selectedIndex = 0;
+  String _analysisSymbol = 'TSLA';
+  String _analysisDisplayName = 'Tesla';
 
-  late final List<Widget> _pages = const [
-    HomeTab(),
-    Analysispage(),
-    Portfolio(),
-    ProfilePage(),
-  ];
+  void _openStockFromPortfolio(String symbol, String displayName) {
+    final sym = symbol.toUpperCase().trim();
+    final name = displayName.trim().isEmpty ? sym : displayName.trim();
+    setState(() {
+      _analysisSymbol = sym;
+      _analysisDisplayName = name;
+      _selectedIndex = 1;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -69,7 +74,16 @@ class _HomepageState extends State<Homepage> {
       body: SafeArea(
         child: IndexedStack(
           index: _selectedIndex,
-          children: _pages,
+          children: [
+            const HomeTab(),
+            Analysispage(
+              key: ValueKey(_analysisSymbol),
+              initialSymbol: _analysisSymbol,
+              initialDisplayName: _analysisDisplayName,
+            ),
+            Portfolio(onOpenStockInAnalysis: _openStockFromPortfolio),
+            const ProfilePage(),
+          ],
         ),
       ),
       bottomNavigationBar: BottomNavigationBar(
@@ -213,7 +227,7 @@ class MarketCarousel extends StatefulWidget {
 }
 
 class _MarketCarouselState extends State<MarketCarousel> {
-  final AlphaVantageService _service = AlphaVantageService();
+  final FinnhubService _service = FinnhubService();
 
   // name -> { price, changeValue, changePct }
   final Map<String, Map<String, dynamic>> _marketData = {};
@@ -261,8 +275,8 @@ class _MarketCarouselState extends State<MarketCarousel> {
           };
         }
 
-        // AlphaVantage free tier rate limit safety
-        await Future.delayed(const Duration(milliseconds: 1300));
+        // Finnhub free-tier courtesy delay between symbols
+        await Future.delayed(const Duration(milliseconds: 350));
       } catch (e) {
         _marketData[name] = {
           'price': null,

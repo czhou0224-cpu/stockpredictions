@@ -10,6 +10,7 @@ No sample/fake article text — if feeds return nothing, platforms show neutral 
 from __future__ import annotations
 
 import logging
+import math
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -218,69 +219,122 @@ def backfill_sentiment_catchup(symbol: str) -> int:
     return filled
 
 
-def sync_price_history_from_alpha_vantage(symbol: str, max_days: int = 100) -> bool:
-    api_key = os.environ.get("ALPHAVANTAGE_API_KEY", "").strip()
-    if not api_key:
+def sync_price_history_from_finnhub(symbol: str, max_days: int = 100) -> bool:
+    token = os.environ.get("FINNHUB_API_KEY", "").strip()
+    if not token:
         try:
             from dotenv import load_dotenv
 
             load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-            api_key = os.environ.get("ALPHAVANTAGE_API_KEY", "").strip()
+            token = os.environ.get("FINNHUB_API_KEY", "").strip()
         except Exception:
             pass
-    if not api_key:
-        log.warning("ALPHAVANTAGE_API_KEY not set in environment; historical price sync skipped")
+    if not token:
+        log.warning("FINNHUB_API_KEY not set in environment; historical price sync skipped")
         return False
 
-    # TIME_SERIES_DAILY_ADJUSTED is premium-only for many keys; DAILY works on free tier.
+    now = int(datetime.utcnow().timestamp())
+    from_ts = now - (max_days + 35) * 86400
     url = (
-        "https://www.alphavantage.co/query"
-        f"?function=TIME_SERIES_DAILY&symbol={symbol}&outputsize=compact&apikey={api_key}"
+        "https://finnhub.io/api/v1/stock/candle"
+        f"?symbol={quote(symbol)}&resolution=D&from={from_ts}&to={now}&token={token}"
     )
 
     try:
-        response = requests.get(url, timeout=12)
+        response = requests.get(url, timeout=15)
+        if response.status_code == 403:
+            log.info(
+                "Finnhub stock/candle returned 403 for %s (many free keys only include /quote); "
+                "historical sync will use yfinance fallback if installed",
+                symbol,
+            )
+            return False
         if response.status_code != 200:
-            log.warning("Alpha Vantage HTTP %s for %s", response.status_code, symbol)
+            log.warning("Finnhub HTTP %s for %s", response.status_code, symbol)
             return False
 
         data = response.json()
-        if "Error Message" in data or "Note" in data or "Information" in data:
-            msg = (
-                data.get("Note")
-                or data.get("Error Message")
-                or data.get("Information")
-                or "unknown"
-            )
-            log.warning("Alpha Vantage sync rejected for %s: %s", symbol, str(msg)[:300])
+        if data.get("s") != "ok":
+            log.warning("Finnhub candle status=%s for %s", data.get("s"), symbol)
             return False
 
-        ts = data.get("Time Series (Daily)")
-        if not isinstance(ts, dict) or not ts:
-            log.warning(
-                "Alpha Vantage: no Time Series (Daily) for %s (keys=%s)",
-                symbol,
-                list(data.keys())[:8],
-            )
+        t_list = data.get("t") or []
+        c_list = data.get("c") or []
+        if not t_list or len(t_list) != len(c_list):
+            log.warning("Finnhub: empty or mismatched candle arrays for %s", symbol)
             return False
 
-        dates = sorted(ts.keys(), reverse=True)[:max_days]
+        pairs: List[Tuple[int, float]] = []
+        for ts, close in zip(t_list, c_list):
+            try:
+                cval = float(close)
+                if cval > 0:
+                    pairs.append((int(ts), cval))
+            except (TypeError, ValueError):
+                continue
+
+        if not pairs:
+            return False
+
+        pairs.sort(key=lambda x: x[0])
+        tail = pairs[-max_days:]
         saved_any = False
-
-        for d in dates:
-            row = ts.get(d, {})
-            close_str = str(row.get("5. adjusted close") or row.get("4. close") or "").strip()
-            close_val = float(close_str)
-            if close_val > 0:
-                save_price(symbol, d, close_val)
-                saved_any = True
+        for ts, close_val in tail:
+            d = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+            save_price(symbol, d, close_val)
+            saved_any = True
 
         if saved_any:
-            log.info("Alpha Vantage: synced %d price rows for %s", len(dates), symbol)
+            log.info("Finnhub: synced %d price rows for %s", len(tail), symbol)
         return saved_any
     except Exception as e:
-        log.warning("Alpha Vantage sync failed for %s: %s", symbol, e)
+        log.warning("Finnhub sync failed for %s: %s", symbol, e)
         return False
+
+
+def sync_price_history_from_yfinance(symbol: str, max_days: int = 100) -> bool:
+    """
+    Fallback daily OHLC when Finnhub stock/candle is not on the API plan (403).
+    Uses Yahoo via yfinance (not an official API; fine for dev / research).
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        log.warning("yfinance not installed; pip install yfinance for historical fallback")
+        return False
+
+    symbol = symbol.upper()
+    try:
+        t = yf.Ticker(symbol)
+        df = t.history(period="2y", interval="1d", auto_adjust=True)
+        if df is None or df.empty:
+            log.warning("yfinance: no rows for %s", symbol)
+            return False
+
+        df = df.sort_index().tail(max_days)
+        saved_any = False
+        for idx, row in df.iterrows():
+            close_val = float(row.get("Close", 0) or 0)
+            if close_val <= 0:
+                continue
+            d = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)[:10]
+            save_price(symbol, d, close_val)
+            saved_any = True
+
+        if saved_any:
+            log.info("yfinance: synced %d price rows for %s (Finnhub candle unavailable)", len(df), symbol)
+        return saved_any
+    except Exception as e:
+        log.warning("yfinance sync failed for %s: %s", symbol, e)
+        return False
+
+
+def sync_price_history(symbol: str, max_days: int = 100) -> bool:
+    """Finnhub daily candles when plan allows; else Yahoo/yfinance fallback."""
+    if sync_price_history_from_finnhub(symbol, max_days=max_days):
+        return True
+    log.info("Finnhub candles skipped/unavailable for %s; trying yfinance fallback", symbol)
+    return sync_price_history_from_yfinance(symbol, max_days=max_days)
 
 
 def compute_correlation(symbol: str, lookback_days: int = 60) -> Optional[float]:
@@ -326,6 +380,30 @@ def compute_correlation(symbol: str, lookback_days: int = 60) -> Optional[float]
     return corr
 
 
+def _realized_daily_volatility(symbol: str, lookback_days: int = 90) -> float:
+    """
+    Std dev of simple daily returns from stored closes (recent realized vol).
+    Used only to scale heuristic forecasts toward plausible magnitudes — not a guarantee.
+    """
+    rows = get_price_history(symbol, days=lookback_days)
+    if len(rows) < 6:
+        return 0.02
+
+    prices = [p for _, p in sorted(rows, key=lambda r: r[0])]
+    rets: List[float] = []
+    for i in range(len(prices) - 1):
+        a, b = prices[i], prices[i + 1]
+        if a > 0 and b > 0:
+            rets.append((b - a) / a)
+
+    if len(rets) < 5:
+        return 0.02
+
+    sigma = float(np.std(np.array(rets, dtype=float)))
+    # Typical US large-cap ~1–3% daily; TSLA often higher; clamp so UI stays bounded
+    return float(max(0.006, min(sigma, 0.08)))
+
+
 def predict_price_movement(
     symbol: str,
     current_aggregate_sentiment: float,
@@ -333,9 +411,17 @@ def predict_price_movement(
     correlation: Optional[float],
     horizon_days: float,
 ) -> Tuple[float, int]:
+    daily_vol = _realized_daily_volatility(symbol)
+    h = max(0.25, min(float(horizon_days), 21.0))
+    vol_over_h = daily_vol * math.sqrt(h)
+
     if correlation is None:
-        drift = (current_aggregate_sentiment - 50) / 50 * 0.01 * min(horizon_days, 7)
-        return current_price * (1 + drift), 25
+        tilt = (current_aggregate_sentiment - 50.0) / 50.0
+        tilt = float(max(-1.0, min(1.0, tilt)))
+        total_return = tilt * vol_over_h * 0.55
+        total_return = float(max(-0.28, min(0.28, total_return)))
+        predicted = current_price * (1.0 + total_return)
+        return predicted, 25
 
     sentiment_rows = get_sentiment_history(symbol, days=90)
     if not sentiment_rows:
@@ -344,11 +430,17 @@ def predict_price_movement(
     hist_sentiments = [r[2] for r in sentiment_rows]
     avg_sentiment = float(np.mean(hist_sentiments))
 
-    sentiment_diff = (current_aggregate_sentiment - avg_sentiment) / 100
-    expected_return_per_day = correlation * sentiment_diff * 0.02
-    total_return = expected_return_per_day * min(horizon_days, 21)
+    sentiment_diff = (current_aggregate_sentiment - avg_sentiment) / 100.0
+    # Map weak numeric signal to [-1, 1]; correlation + sentiment set direction / strength
+    raw_tilt = correlation * sentiment_diff * 12.0
+    tilt = float(max(-1.0, min(1.0, raw_tilt)))
 
-    predicted = current_price * (1 + total_return)
+    # Magnitude scales with sqrt(horizon) × realized daily vol (rough random-walk scaling)
+    total_return = tilt * vol_over_h * 0.95
+    max_move = min(0.42, 4.5 * daily_vol * math.sqrt(h))
+    total_return = float(max(-max_move, min(max_move, total_return)))
+
+    predicted = current_price * (1.0 + total_return)
     confidence = int(min(90, 40 + abs(correlation) * 40 + min(30, len(sentiment_rows) // 3)))
     return predicted, max(25, confidence)
 
@@ -372,7 +464,7 @@ def run_analysis(symbol: str, current_price: float) -> Dict:
 
     save_price(symbol, today, current_price)
 
-    historical_prices_synced = sync_price_history_from_alpha_vantage(symbol)
+    historical_prices_synced = sync_price_history(symbol)
 
     sentiment_backfill_days = backfill_sentiment_catchup(symbol)
 

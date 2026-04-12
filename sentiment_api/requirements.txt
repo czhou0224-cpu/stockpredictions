@@ -5,3 +5,4 @@ requests>=2.31.0
 feedparser>=6.0.0
 textblob>=0.18.0
 numpy>=1.24.0
+yfinance>=0.2.40

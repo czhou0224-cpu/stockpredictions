@@ -5,11 +5,14 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-import 'alpha_vantage_service.dart';
+import 'finnhub_service.dart';
 import 'PortfolioFirestoreService.dart';
 
 class Portfolio extends StatefulWidget {
-  const Portfolio({super.key});
+  const Portfolio({super.key, this.onOpenStockInAnalysis});
+
+  /// Switches to Analysis and loads quote + predictions for this holding.
+  final void Function(String symbol, String displayName)? onOpenStockInAnalysis;
 
   @override
   State<Portfolio> createState() => _PortfolioState();
@@ -17,7 +20,7 @@ class Portfolio extends StatefulWidget {
 
 class _PortfolioState extends State<Portfolio> {
   final PortfolioFirestoreService _firestoreService = PortfolioFirestoreService();
-  final AlphaVantageService _alphaService = AlphaVantageService();
+  final FinnhubService _finnhubService = FinnhubService();
 
   List<Map<String, dynamic>> holdings = [];
 
@@ -60,6 +63,7 @@ class _PortfolioState extends State<Portfolio> {
         final data = doc.data();
 
         final symbol = (data['symbol'] ?? doc.id).toString().toUpperCase();
+        final displayName = (data['name'] ?? '').toString().trim();
         final qty = (data['qty'] as num?)?.toInt() ?? 0;
 
         // ✅ avg buy price stored in Firestore as buyPrice (weighted avg)
@@ -83,6 +87,7 @@ class _PortfolioState extends State<Portfolio> {
 
         return {
           "stock": symbol,
+          "name": displayName.isEmpty ? symbol : displayName,
           "qty": qty,
           "value": value,
           "avgBuyPrice": avgBuyPrice, // kept for internal calc
@@ -129,7 +134,7 @@ class _PortfolioState extends State<Portfolio> {
       for (int i = 0; i < missing.length; i++) {
         final sym = missing[i];
 
-        final price = await _alphaService.fetchCurrentPrice(sym);
+        final price = await _finnhubService.fetchCurrentPrice(sym);
         if (price != null && price > 0) {
           _priceCache[sym] = price;
         }
@@ -165,6 +170,7 @@ class _PortfolioState extends State<Portfolio> {
 
           return {
             ...h,
+            "name": (h["name"] ?? sym).toString(),
             "value": value,
             "changePct": double.parse(changePct.toStringAsFixed(2)),
             "changeValue": double.parse(changeValue.toStringAsFixed(2)),
@@ -406,54 +412,95 @@ class _PortfolioState extends State<Portfolio> {
                           itemCount: holdings.length,
                           itemBuilder: (context, index) {
                             final h = holdings[index];
+                            final sym = (h["stock"] ?? "").toString();
+                            final dispName =
+                                (h["name"] ?? sym).toString().trim().isEmpty
+                                    ? sym
+                                    : (h["name"] ?? sym).toString().trim();
                             return Padding(
-                              padding: const EdgeInsets.only(bottom: 12),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  const SizedBox(width: 10),
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: Material(
+                                color: Colors.transparent,
+                                child: InkWell(
+                                  borderRadius: BorderRadius.circular(12),
+                                  onTap: widget.onOpenStockInAnalysis == null
+                                      ? null
+                                      : () => widget.onOpenStockInAnalysis!(
+                                            sym,
+                                            dispName,
+                                          ),
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 8,
+                                      horizontal: 4,
+                                    ),
+                                    child: Row(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
                                       children: [
-                                        Text(
-                                          h["stock"],
-                                          style: const TextStyle(
-                                            fontSize: 16,
-                                            color: Colors.white,
+                                        const SizedBox(width: 6),
+                                        Expanded(
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                h["stock"] as String,
+                                                style: const TextStyle(
+                                                  fontSize: 16,
+                                                  color: Colors.white,
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                              ),
+                                              const SizedBox(height: 2),
+                                              Text(
+                                                "${h["qty"]} Shares · \$${h["value"]}",
+                                                style: const TextStyle(
+                                                  color: Colors.white70,
+                                                  fontSize: 13,
+                                                ),
+                                              ),
+                                              if (widget.onOpenStockInAnalysis !=
+                                                  null)
+                                                const Padding(
+                                                  padding: EdgeInsets.only(top: 4),
+                                                  child: Text(
+                                                    "Tap for analysis",
+                                                    style: TextStyle(
+                                                      color: Colors.blueAccent,
+                                                      fontSize: 11,
+                                                    ),
+                                                  ),
+                                                ),
+                                            ],
                                           ),
                                         ),
-                                        const SizedBox(height: 2),
-                                        Text(
-                                          "${h["qty"]} Shares · \$${h["value"]}",
-                                          style: const TextStyle(
-                                            color: Colors.white70,
-                                            fontSize: 13,
-                                          ),
+                                        Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.end,
+                                          children: [
+                                            Text(
+                                              "${(h["changePct"] as num) > 0 ? "+" : ""}${h["changePct"]}%",
+                                              style: TextStyle(
+                                                color: (h["changePct"] as num) >= 0
+                                                    ? Colors.green
+                                                    : Colors.red,
+                                                fontSize: 16,
+                                              ),
+                                            ),
+                                            Text(
+                                              "${(h["changeValue"] as num) >= 0 ? '+' : '-'}\$${(h["changeValue"] as num).abs()}",
+                                              style: const TextStyle(
+                                                color: Colors.white70,
+                                                fontSize: 12,
+                                              ),
+                                            ),
+                                          ],
                                         ),
                                       ],
                                     ),
                                   ),
-                                  Column(
-                                    crossAxisAlignment: CrossAxisAlignment.end,
-                                    children: [
-                                      Text(
-                                        "${(h["changePct"] as num) > 0 ? "+" : ""}${h["changePct"]}%",
-                                        style: TextStyle(
-                                          color: (h["changePct"] as num) >= 0 ? Colors.green : Colors.red,
-                                          fontSize: 16,
-                                        ),
-                                      ),
-                                      Text(
-                                        "${(h["changeValue"] as num) >= 0 ? '+' : '-'}\$${(h["changeValue"] as num).abs()}",
-                                        style: const TextStyle(
-                                          color: Colors.white70,
-                                          fontSize: 12,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ],
+                                ),
                               ),
                             );
                           },
@@ -596,7 +643,7 @@ class AddStockSheet extends StatefulWidget {
 }
 
 class _AddStockSheetState extends State<AddStockSheet> {
-  final AlphaVantageService _alphaService = AlphaVantageService();
+  final FinnhubService _finnhubService = FinnhubService();
 
   final TextEditingController stockController = TextEditingController();
   final TextEditingController qtyController = TextEditingController();
@@ -697,7 +744,7 @@ class _AddStockSheetState extends State<AddStockSheet> {
                 }
 
                 try {
-                  final result = await _alphaService.verifySymbol(input);
+                  final result = await _finnhubService.verifySymbol(input);
 
                   if (result == null) {
                     Navigator.pop(context, {"error": "Stock not found"});
