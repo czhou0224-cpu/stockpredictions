@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'dart:async';
 import 'package:stockpredicitonsss/login.dart';
 import 'package:stockpredicitonsss/security.dart';
 import 'editprofile.dart';
 import 'package:stockpredicitonsss/UserProfileFirestoreService.dart';
+import 'package:stockpredicitonsss/PortfolioFirestoreService.dart';
+import 'package:stockpredicitonsss/finnhub_service.dart';
 
 class ProfilePage extends StatefulWidget {
   const ProfilePage({super.key});
@@ -19,9 +22,14 @@ class _ProfilePageState extends State<ProfilePage> {
   String pfpUrl =
       'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQLN5vl60jUiaXISUA1N8sGtf-6TsDsEWXRUDiLNB6D7kE0o4zcMnJ4r9CFXzJR9XRvoO_i2glF5EOss84mZgqi291Smb1m2RJKCELUdqy5&s=10';
 
-  int totalStocks = 42;
+  int totalStocks = 0;
   int daysOnApp = 128;
-  double totalProfit = 2750.50;
+  double totalProfit = 0.0;
+
+  final PortfolioFirestoreService _portfolioService = PortfolioFirestoreService();
+  final FinnhubService _finnhubService = FinnhubService();
+  final Map<String, double> _priceCache = {};
+  StreamSubscription? _holdingsSub;
 
   String getRank() {
     if (totalProfit >= 50000) return "Diamond";
@@ -53,11 +61,23 @@ class _ProfilePageState extends State<ProfilePage> {
   void initState() {
     super.initState();
     _loadProfile();
+    _listenToHoldings();
+  }
+
+  @override
+  void dispose() {
+    _holdingsSub?.cancel();
+    super.dispose();
   }
 
   Future<void> _loadProfile() async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
+
+    final creationTime = user.metadata.creationTime;
+    final computedDaysOnApp = creationTime == null
+        ? 0
+        : DateTime.now().difference(creationTime).inDays.clamp(0, 999999);
 
     final service = UserProfileFirestoreService();
     final data = await service.getUserProfile(user.uid);
@@ -100,7 +120,70 @@ class _ProfilePageState extends State<ProfilePage> {
       username = (fresh['username'] ?? username).toString();
       displayName = (fresh['displayName'] ?? displayName).toString();
       pfpUrl = (fresh['photoUrl'] ?? pfpUrl).toString();
+      daysOnApp = computedDaysOnApp;
     });
+  }
+
+  void _listenToHoldings() {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      if (!mounted) return;
+      setState(() {
+        totalStocks = 0;
+        totalProfit = 0.0;
+      });
+      return;
+    }
+
+    _holdingsSub?.cancel();
+    _holdingsSub = _portfolioService.holdingsStream(user.uid).listen((snapshot) async {
+      final holdings = snapshot.docs.map((doc) => doc.data()).toList();
+      final symbols = holdings
+          .map((h) => (h['symbol'] ?? '').toString().toUpperCase())
+          .where((s) => s.isNotEmpty)
+          .toSet()
+          .toList();
+
+      await _refreshMissingPrices(symbols);
+      if (!mounted) return;
+
+      double unrealized = 0.0;
+      for (final h in holdings) {
+        final symbol = (h['symbol'] ?? '').toString().toUpperCase();
+        final qty = (h['qty'] as num?)?.toDouble() ?? 0.0;
+        final avgBuyPrice = (h['buyPrice'] as num?)?.toDouble() ?? 0.0;
+        final currentPrice = _priceCache[symbol];
+
+        if (qty > 0 && avgBuyPrice > 0 && currentPrice != null && currentPrice > 0) {
+          unrealized += (currentPrice - avgBuyPrice) * qty;
+        }
+      }
+
+      setState(() {
+        // Number of stock entries user has added.
+        totalStocks = holdings.length;
+        totalProfit = double.parse(unrealized.toStringAsFixed(2));
+      });
+    });
+  }
+
+  Future<void> _refreshMissingPrices(List<String> symbols) async {
+    final missing = symbols.where((s) => !_priceCache.containsKey(s)).toList();
+    for (int i = 0; i < missing.length; i++) {
+      final symbol = missing[i];
+      try {
+        final price = await _finnhubService.fetchCurrentPrice(symbol);
+        if (price != null && price > 0) {
+          _priceCache[symbol] = price;
+        }
+      } catch (_) {
+        // Keep going if one quote fails.
+      }
+
+      if (i < missing.length - 1) {
+        await Future.delayed(const Duration(milliseconds: 1200));
+      }
+    }
   }
 
   Future<void> _logout() async {

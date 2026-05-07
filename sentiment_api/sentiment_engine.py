@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -44,6 +45,13 @@ PLATFORM_RELIABILITY = {
     "cnbc": 82,
 }
 
+OPENAI_MODEL_DEFAULT = "gpt-4o-mini"
+OPENAI_TIMEOUT_SECONDS = 20
+OPENAI_MAX_ITEMS_PER_PLATFORM = 12
+OPENAI_MIN_SUCCESS_PER_PLATFORM = 1
+
+_OPENAI_CACHE: Dict[str, Optional[float]] = {}
+
 
 def analyze_sentiment_nlp(text: str) -> float:
     if not text or not str(text).strip():
@@ -51,6 +59,140 @@ def analyze_sentiment_nlp(text: str) -> float:
     blob = TextBlob(str(text))
     polarity = blob.sentiment.polarity
     return max(0, min(100, 50 + polarity * 50))
+
+
+def _openai_api_key() -> str:
+    return os.environ.get("OPENAI_API_KEY", "").strip()
+
+
+def _openai_model() -> str:
+    model = os.environ.get("OPENAI_MODEL", "").strip()
+    return model or OPENAI_MODEL_DEFAULT
+
+
+def _require_openai_config() -> None:
+    if not _openai_api_key():
+        raise RuntimeError(
+            "OPENAI_API_KEY is required for sentiment analysis. Add it to root .env and restart the backend."
+        )
+
+
+def _analyze_sentiment_openai(text: str) -> Optional[float]:
+    """
+    Returns sentiment score in [0, 100] from OpenAI, or None if disabled/failed.
+    """
+    if not text or not text.strip():
+        return None
+
+    key = _openai_api_key()
+    if not key:
+        return None
+
+    cache_key = text[:800]
+    if cache_key in _OPENAI_CACHE:
+        return _OPENAI_CACHE[cache_key]
+
+    prompt = (
+        "You are a financial-news sentiment scorer. "
+        "Given one stock headline/snippet, return strict JSON only: "
+        '{"sentiment_score": <number 0..100>}. '
+        "50 is neutral, above 50 bullish, below 50 bearish. "
+        "Do not include extra keys or text.\n\n"
+        f"Headline:\n{text[:2000]}"
+    )
+
+    payload = {
+        "model": _openai_model(),
+        "input": prompt,
+    }
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+            timeout=OPENAI_TIMEOUT_SECONDS,
+        )
+        if r.status_code != 200:
+            log.warning("OpenAI sentiment HTTP %s", r.status_code)
+            _OPENAI_CACHE[cache_key] = None
+            return None
+
+        body = r.json()
+        score: Optional[float] = None
+
+        # Preferred: Responses API convenience field (when available)
+        raw_text = body.get("output_text")
+        if isinstance(raw_text, str) and raw_text.strip():
+            try:
+                parsed = json.loads(raw_text)
+                if isinstance(parsed, dict) and parsed.get("sentiment_score") is not None:
+                    score = float(parsed.get("sentiment_score"))
+            except Exception:
+                score = None
+
+        # Fallback: parse output[].content[] text blocks
+        if score is None:
+            for item in body.get("output", []) or []:
+                for content in item.get("content", []) or []:
+                    if content.get("type") != "output_text":
+                        continue
+                    txt = (content.get("text") or "").strip()
+                    if not txt:
+                        continue
+                    try:
+                        parsed = json.loads(txt)
+                        if isinstance(parsed, dict) and parsed.get("sentiment_score") is not None:
+                            score = float(parsed.get("sentiment_score"))
+                            break
+                    except Exception:
+                        continue
+                if score is not None:
+                    break
+
+        if score is None:
+            log.warning("OpenAI sentiment response missing sentiment_score")
+            _OPENAI_CACHE[cache_key] = None
+            return None
+
+        score = float(max(0.0, min(100.0, score)))
+        _OPENAI_CACHE[cache_key] = score
+        return score
+    except Exception as e:
+        log.warning("OpenAI sentiment call failed: %s", e)
+        _OPENAI_CACHE[cache_key] = None
+        return None
+
+
+def _platform_sentiment_score(texts_with_count: List[Tuple[str, int]]) -> float:
+    if not texts_with_count:
+        return 50.0
+
+    # Baseline lexical signal.
+    base_scores = [analyze_sentiment_nlp(t) for t, _ in texts_with_count]
+    base_score = float(np.mean(base_scores))
+
+    # Optional OpenAI enhancement on a bounded subset (cost/latency guardrail).
+    sample = texts_with_count[:OPENAI_MAX_ITEMS_PER_PLATFORM]
+    openai_scores = []
+    for text, _ in sample:
+        s = _analyze_sentiment_openai(text)
+        if s is not None:
+            openai_scores.append(s)
+
+    if len(openai_scores) < OPENAI_MIN_SUCCESS_PER_PLATFORM:
+        raise RuntimeError(
+            "OpenAI sentiment scoring is required but unavailable. "
+            "Check OPENAI_API_KEY, model access, and network, then retry."
+        )
+
+    llm_score = float(np.mean(openai_scores))
+    # Blend: keep legacy behavior dominant while using LLM nuance as refinement.
+    return float(0.6 * base_score + 0.4 * llm_score)
 
 
 def _fetch_google_news_rss(symbol: str, site_domain: str, max_items: int = 30) -> List[Tuple[str, int]]:
@@ -171,8 +313,7 @@ def _persist_platform_sentiment(
             score = 50.0
             mention_count = 0
         else:
-            scores = [analyze_sentiment_nlp(t) for t, _ in texts_with_count]
-            score = float(np.mean(scores))
+            score = _platform_sentiment_score(texts_with_count)
             mention_count = sum(c for _, c in texts_with_count)
 
         save_sentiment(symbol, date_str, platform, score, mention_count)
@@ -461,6 +602,7 @@ def run_analysis(symbol: str, current_price: float) -> Dict:
     init_db()
     symbol = symbol.upper()
     today = datetime.utcnow().strftime("%Y-%m-%d")
+    _require_openai_config()
 
     save_price(symbol, today, current_price)
 

@@ -736,7 +736,14 @@ class _AddStockSheetState extends State<AddStockSheet> {
                 final buyText = purchasePriceController.text.trim();
                 final buyPrice = double.tryParse(buyText);
 
-                if (input.isEmpty || qty <= 0) return;
+                if (input.isEmpty) {
+                  Navigator.pop(context, {"error": "Please enter a stock symbol."});
+                  return;
+                }
+                if (qty <= 0) {
+                  Navigator.pop(context, {"error": "Quantity must be greater than 0."});
+                  return;
+                }
 
                 if (buyText.isEmpty || buyPrice == null || buyPrice <= 0) {
                   Navigator.pop(context, {"error": "Please enter the purchase price."});

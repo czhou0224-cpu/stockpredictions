@@ -30,6 +30,13 @@ class UserProfileFirestoreService {
     return doc.data();
   }
 
+  /// Live updates when profile fields (e.g. photoUrl) change.
+  Stream<Map<String, dynamic>?> userProfileStream(String uid) {
+    return _db.collection('users').doc(uid).snapshots().map(
+          (snap) => snap.exists ? snap.data() : null,
+        );
+  }
+
   /// Update profile fields (only updates what you pass in)
   Future<void> updateUserProfile({
     required String uid,

@@ -35,6 +35,22 @@ class FinnhubService {
     final query = input.trim().toUpperCase();
     if (query.isEmpty || _token.isEmpty) return null;
 
+    // Fast-path: if quote resolves, the symbol is tradable enough for our app.
+    final quoteUrl = Uri.parse(
+      '$_base/quote?symbol=${Uri.encodeComponent(query)}&token=$_token',
+    );
+    final quoteRes = await http.get(quoteUrl);
+    if (quoteRes.statusCode == 429) {
+      throw Exception('Finnhub rate limit — wait a minute and try again.');
+    }
+    if (quoteRes.statusCode == 200) {
+      final q = jsonDecode(quoteRes.body) as Map<String, dynamic>;
+      final c = (q['c'] as num?)?.toDouble();
+      if (c != null && c > 0) {
+        return SymbolResult(symbol: query, name: query);
+      }
+    }
+
     final url = Uri.parse(
       '$_base/search?q=${Uri.encodeComponent(query)}&token=$_token',
     );

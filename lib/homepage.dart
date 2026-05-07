@@ -1,9 +1,15 @@
+import 'dart:async';
+
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:carousel_slider/carousel_slider.dart';
 import 'package:stockpredicitonsss/analysispage.dart';
 import 'package:stockpredicitonsss/profilepage.dart';
+import 'package:stockpredicitonsss/UserProfileFirestoreService.dart';
 import 'port.dart';
 import 'finnhub_service.dart';
+import 'prediction_display_adjustment.dart';
+import 'sentiment_prediction_service.dart';
 
 class Homepage extends StatefulWidget {
   const Homepage({super.key});
@@ -16,6 +22,79 @@ class _HomepageState extends State<Homepage> {
   int _selectedIndex = 0;
   String _analysisSymbol = 'TSLA';
   String _analysisDisplayName = 'Tesla';
+
+  final UserProfileFirestoreService _profileService = UserProfileFirestoreService();
+  StreamSubscription<User?>? _authSub;
+  StreamSubscription<Map<String, dynamic>?>? _profileSub;
+  String? _profilePhotoUrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _authSub = FirebaseAuth.instance.authStateChanges().listen(_attachProfilePhotoStream);
+  }
+
+  @override
+  void dispose() {
+    _authSub?.cancel();
+    _profileSub?.cancel();
+    super.dispose();
+  }
+
+  void _attachProfilePhotoStream(User? user) {
+    _profileSub?.cancel();
+    _profileSub = null;
+    if (user == null) {
+      if (mounted) setState(() => _profilePhotoUrl = null);
+      return;
+    }
+    _profileSub = _profileService.userProfileStream(user.uid).listen((data) {
+      if (!mounted) return;
+      final raw = data?['photoUrl']?.toString().trim();
+      setState(() {
+        _profilePhotoUrl = (raw != null && raw.isNotEmpty) ? raw : null;
+      });
+    });
+  }
+
+  Widget _appBarProfileAvatar() {
+    final url = _profilePhotoUrl;
+    const size = 40.0;
+    if (url == null || url.isEmpty) {
+      return const CircleAvatar(
+        radius: 20,
+        backgroundColor: Colors.white24,
+        child: Icon(Icons.person, color: Colors.white, size: 22),
+      );
+    }
+    return ClipOval(
+      child: Image.network(
+        url,
+        width: size,
+        height: size,
+        fit: BoxFit.cover,
+        errorBuilder: (_, __, ___) => const CircleAvatar(
+          radius: 20,
+          backgroundColor: Colors.white24,
+          child: Icon(Icons.person, color: Colors.white, size: 22),
+        ),
+        loadingBuilder: (context, child, loadingProgress) {
+          if (loadingProgress == null) return child;
+          return const SizedBox(
+            width: size,
+            height: size,
+            child: Center(
+              child: SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white70),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
 
   void _openStockFromPortfolio(String symbol, String displayName) {
     final sym = symbol.toUpperCase().trim();
@@ -62,12 +141,7 @@ class _HomepageState extends State<Homepage> {
               ),
             ),
             const SizedBox(width: 12),
-            const CircleAvatar(
-              radius: 20.0,
-              backgroundImage: NetworkImage(
-                'https://encrypted-tbn2.gstatic.com/licensed-image?q=tbn:ANd9GcTaeAcrJKYODtjXRJKaaC4aRCAC8AlCUM8zWRKxd8XeuQEfADv_U51AXZayY802ctEiksTZb9eeckq5Vp7IQyzg-8-o9OcJ5o-hmzflFnmsW6pwVyAyuIR8_8uvfp2be47Prd4f_-N8MnL-',
-              ),
-            ),
+            _appBarProfileAvatar(),
           ],
         ),
       ),
@@ -122,23 +196,23 @@ class HomeTab extends StatelessWidget {
               color: Colors.white.withOpacity(0.05),
               borderRadius: BorderRadius.circular(25),
             ),
-            child: const Padding(
+            child: Padding(
               padding: EdgeInsets.fromLTRB(20, 15, 20, 15),
-              child: SingleChildScrollView(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SizedBox(height: 40),
-                    Text(
-                      "Top Predictions",
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 22,
-                        fontWeight: FontWeight.bold,
-                      ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: const [
+                  SizedBox(height: 8),
+                  Text(
+                    "Top Predictions",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
                     ),
-                  ],
-                ),
+                  ),
+                  SizedBox(height: 12),
+                  Expanded(child: TopPredictionsList()),
+                ],
               ),
             ),
           ),
@@ -215,6 +289,216 @@ class HomeTab extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+class PredictedStockMove {
+  final String symbol;
+  final double predictedIncreasePct;
+  final double predictedIncreaseValue;
+
+  const PredictedStockMove({
+    required this.symbol,
+    required this.predictedIncreasePct,
+    required this.predictedIncreaseValue,
+  });
+}
+
+class TopPredictionsList extends StatefulWidget {
+  const TopPredictionsList({super.key});
+
+  @override
+  State<TopPredictionsList> createState() => _TopPredictionsListState();
+}
+
+class _TopPredictionsListState extends State<TopPredictionsList> {
+  final FinnhubService _finnhubService = FinnhubService();
+  final SentimentPredictionService _sentimentService = SentimentPredictionService();
+  static const int _maxSymbolsToScore = 14;
+  static const int _parallelWorkers = 4;
+  static const Duration _quoteTimeout = Duration(seconds: 10);
+  static const Duration _analysisTimeout = Duration(seconds: 25);
+
+  final List<String> _candidateSymbols = const [
+    // Technology / AI
+    'AAPL',
+    'MSFT',
+    'NVDA',
+    'AMD',
+    'AVGO',
+    'GOOGL',
+    'META',
+    // Consumer / retail
+    'AMZN',
+    'COST',
+    'WMT',
+    'TSLA',
+    // Financials
+    'JPM',
+    'BAC',
+    'GS',
+    // Energy
+    'XOM',
+    'CVX',
+    'SLB',
+    // Defense / aerospace
+    'LMT',
+    'NOC',
+    'RTX',
+    'GD',
+    // Healthcare
+    'JNJ',
+    'PFE',
+    'UNH',
+    // Industrials / transport
+    'UNP',
+    'CAT',
+    'DE',
+    // Materials / commodities
+    'NUE',
+    'FCX',
+    // Real estate / infrastructure
+    'PLD',
+    'AMT',
+  ];
+
+  late final Future<List<PredictedStockMove>> _predictionsFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _predictionsFuture = _loadTopPredictions();
+  }
+
+  Future<List<PredictedStockMove>> _loadTopPredictions() async {
+    final results = <PredictedStockMove>[];
+    final symbols = _candidateSymbols.take(_maxSymbolsToScore).toList();
+
+    Future<PredictedStockMove?> evaluateSymbol(String symbol) async {
+      final quote = await _finnhubService
+          .fetchQuoteWithPreviousClose(symbol)
+          .timeout(_quoteTimeout, onTimeout: () => null);
+      final currentPrice = quote?.price ??
+          SentimentPredictionService.defaultPriceForSymbol(symbol);
+
+      final analysis = await _sentimentService
+          .getAnalysisForSymbol(
+            symbol: symbol,
+            currentPrice: currentPrice,
+          )
+          .timeout(_analysisTimeout, onTimeout: () => null);
+
+      final prediction = analysis?.predictions[PredictionInterval.oneWeek] ??
+          SentimentPredictionService.getDemoAnalysis(symbol, currentPrice)
+              .predictions[PredictionInterval.oneWeek];
+
+      final predictedPrice = prediction?.predictedPrice;
+      if (predictedPrice == null || currentPrice <= 0) return null;
+
+      final adjusted = PredictionDisplayAdjustment.adjustedPredictedPrice(
+        symbol: symbol,
+        currentPrice: currentPrice,
+        modelPredictedPrice: predictedPrice,
+        quote: quote,
+      );
+      if (adjusted == null) return null;
+
+      final variedIncreasePct = ((adjusted - currentPrice) / currentPrice) * 100.0;
+      final increaseValue = adjusted - currentPrice;
+
+      return PredictedStockMove(
+        symbol: symbol,
+        predictedIncreasePct: variedIncreasePct,
+        predictedIncreaseValue: increaseValue,
+      );
+    }
+
+    for (int i = 0; i < symbols.length; i += _parallelWorkers) {
+      final end = (i + _parallelWorkers < symbols.length)
+          ? i + _parallelWorkers
+          : symbols.length;
+      final batch = symbols.sublist(i, end);
+      final batchResults = await Future.wait(
+        batch.map((symbol) async {
+          try {
+            return await evaluateSymbol(symbol).timeout(
+              _quoteTimeout + _analysisTimeout,
+              onTimeout: () => null,
+            );
+          } catch (_) {
+            return null;
+          }
+        }),
+      );
+      results.addAll(batchResults.whereType<PredictedStockMove>());
+      if (results.length >= 8) {
+        // We only need enough rows to rank and display quickly.
+        break;
+      }
+    }
+
+    results.removeWhere(
+      (item) => item.predictedIncreasePct <= 0 || item.predictedIncreaseValue <= 0,
+    );
+    results.sort((a, b) => b.predictedIncreasePct.compareTo(a.predictedIncreasePct));
+    return results;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<List<PredictedStockMove>>(
+      future: _predictionsFuture,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        final data = snapshot.data ?? const <PredictedStockMove>[];
+        if (data.isEmpty) {
+          return const Center(
+            child: Text(
+              'No predictions available right now.',
+              style: TextStyle(color: Colors.white70),
+            ),
+          );
+        }
+
+        return ListView.separated(
+          itemCount: data.length,
+          separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.white12),
+          itemBuilder: (context, index) {
+            final item = data[index];
+            final isPositive = item.predictedIncreaseValue >= 0;
+            final rank = index + 1;
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 10),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '$rank. ${item.symbol}',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 16,
+                      ),
+                    ),
+                  ),
+                  Text(
+                    '${isPositive ? '+' : '-'}${item.predictedIncreasePct.abs().toStringAsFixed(2)}% (\$${item.predictedIncreaseValue.abs().toStringAsFixed(2)})',
+                    style: TextStyle(
+                      color: isPositive ? Colors.greenAccent : Colors.redAccent,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 14,
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
     );
   }
 }
@@ -343,12 +627,12 @@ class _MarketCarouselState extends State<MarketCarousel> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  hasData ? "\$${price!.toStringAsFixed(0)}" : "—",
+                  hasData ? "\$${price.toStringAsFixed(0)}" : "—",
                   style: const TextStyle(color: Colors.white70, fontSize: 16),
                 ),
                 Text(
                   hasData
-                      ? "${isPositive ? "+" : "-"}\$${changeValue!.abs().toStringAsFixed(0)} (${changePct!.toStringAsFixed(2)}%)"
+                      ? "${isPositive ? "+" : "-"}\$${changeValue.abs().toStringAsFixed(0)} (${changePct.toStringAsFixed(2)}%)"
                       : "—",
                   style: TextStyle(
                     color: hasData ? color : Colors.white54,

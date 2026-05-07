@@ -112,9 +112,9 @@ class SentimentPredictionService {
       }
 
       final response = await http.get(uri).timeout(
-        const Duration(seconds: 15),
+        const Duration(seconds: 45),
         onTimeout: () => throw Exception(
-          'Timeout after 15s — is Flask running? Can emulator reach ${baseUrl!}?',
+          'Timeout after 45s — is Flask running? Can emulator reach ${baseUrl!}?',
         ),
       );
 

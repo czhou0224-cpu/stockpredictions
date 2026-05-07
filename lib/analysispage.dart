@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'finnhub_service.dart';
+import 'prediction_display_adjustment.dart';
 import 'sentiment_prediction_service.dart';
 
 class Analysispage extends StatefulWidget {
@@ -17,6 +18,13 @@ class Analysispage extends StatefulWidget {
 }
 
 class _AnalysispageState extends State<Analysispage> {
+  // Controls visibility of debug/fallback messaging in the UI.
+  static const bool _showAnalysisDebugMessages = true;
+  static const int _maxFallbackRetries = 2;
+  static const Duration _fallbackRetryDelay = Duration(seconds: 4);
+  static const Duration _analysisAttemptTimeout = Duration(seconds: 20);
+  static const Duration _analysisTotalBudget = Duration(seconds: 35);
+
   bool searching = false;
   late String _stockSymbol;
   late String _stockDisplayName;
@@ -29,6 +37,10 @@ class _AnalysispageState extends State<Analysispage> {
   final SentimentPredictionService _sentimentService =
   SentimentPredictionService();
 
+  final TextEditingController _searchController = TextEditingController();
+  final FocusNode _searchFocusNode = FocusNode();
+  int _loadRequestId = 0;
+
   @override
   void initState() {
     super.initState();
@@ -38,6 +50,13 @@ class _AnalysispageState extends State<Analysispage> {
         : widget.initialDisplayName.trim();
     _selectedInterval = PredictionInterval.oneDay;
     _loadAnalysis();
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    _searchFocusNode.dispose();
+    super.dispose();
   }
 
   @override
@@ -63,6 +82,9 @@ class _AnalysispageState extends State<Analysispage> {
   }
 
   Future<void> _loadAnalysis() async {
+    final requestId = ++_loadRequestId;
+    final symbolAtStart = _stockSymbol;
+    final startedAt = DateTime.now();
     setState(() => _loading = true);
 
     try {
@@ -82,23 +104,46 @@ class _AnalysispageState extends State<Analysispage> {
             ? SentimentPredictionService.defaultPriceForSymbol(_stockSymbol)
             : null;
 
-        final analysis = await _sentimentService.getAnalysisForSymbol(
-          symbol: _stockSymbol,
-          currentPrice: price,
-          fallbackPrice: fallbackPrice,
-        );
+        StockSentimentAnalysis? analysis;
+        for (int attempt = 0; attempt <= _maxFallbackRetries; attempt++) {
+          analysis = await _sentimentService
+              .getAnalysisForSymbol(
+                symbol: symbolAtStart,
+                currentPrice: price,
+                fallbackPrice: fallbackPrice,
+              )
+              .timeout(_analysisAttemptTimeout, onTimeout: () => null);
+
+          if (!mounted || requestId != _loadRequestId || symbolAtStart != _stockSymbol) {
+            return;
+          }
+
+          // Stop retrying once a non-fallback live result arrives.
+          if (analysis != null && !analysis.isFallbackPrediction) {
+            break;
+          }
+
+          final elapsed = DateTime.now().difference(startedAt);
+          if (elapsed >= _analysisTotalBudget) {
+            break;
+          }
+
+          final hasAnotherAttempt = attempt < _maxFallbackRetries;
+          if (!hasAnotherAttempt) break;
+          await Future.delayed(_fallbackRetryDelay);
+        }
 
         if (mounted) {
           setState(() {
             _analysis =
                 analysis ??
-                    SentimentPredictionService.getDemoAnalysis(_stockSymbol, price);
+                    SentimentPredictionService.getDemoAnalysis(symbolAtStart, price);
           });
         }
       } else if (mounted) {
         setState(() {
           _analysis = SentimentPredictionService.getDemoAnalysis(
-            _stockSymbol,
+            symbolAtStart,
             price,
           );
         });
@@ -106,11 +151,82 @@ class _AnalysispageState extends State<Analysispage> {
     } catch (_) {
       if (mounted) {
         setState(() {
-          _analysis = SentimentPredictionService.getDemoAnalysis(_stockSymbol, 0);
+          _analysis = SentimentPredictionService.getDemoAnalysis(symbolAtStart, 0);
         });
       }
     } finally {
-      if (mounted) setState(() => _loading = false);
+      if (mounted && requestId == _loadRequestId) {
+        setState(() => _loading = false);
+      }
+    }
+  }
+
+  Future<void> _submitSearch() async {
+    final raw = _searchController.text.trim();
+    if (raw.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Enter a stock ticker.'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
+    }
+
+    FocusScope.of(context).unfocus();
+    setState(() => _loading = true);
+
+    try {
+      final result = await _finnhub.verifySymbol(raw);
+      if (!mounted) return;
+
+      if (result == null) {
+        setState(() => _loading = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Does not exist'),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+        return;
+      }
+
+      final sym = result.symbol.toUpperCase().trim();
+      final name = result.name.trim().isEmpty ? sym : result.name.trim();
+
+      setState(() {
+        _stockSymbol = sym;
+        _stockDisplayName = name;
+        searching = false;
+        _searchController.clear();
+      });
+      _searchFocusNode.unfocus();
+
+      await _loadAnalysis();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _loading = false);
+      final msg = e.toString().replaceFirst('Exception: ', '');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(msg.isNotEmpty ? msg : 'Something went wrong'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  void _toggleSearchMode() {
+    if (searching) {
+      _searchController.clear();
+      _searchFocusNode.unfocus();
+      setState(() => searching = false);
+    } else {
+      setState(() => searching = true);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _searchFocusNode.requestFocus();
+      });
     }
   }
 
@@ -203,6 +319,19 @@ class _AnalysispageState extends State<Analysispage> {
     final interval = _selectedInterval ?? PredictionInterval.oneDay;
     final prediction = _analysis?.predictions[interval];
 
+    final double? displayPredictedPrice =
+        prediction?.predictedPrice != null &&
+                prediction!.predictedPrice! > 0 &&
+                currentPrice > 0
+            ? PredictionDisplayAdjustment.adjustedPredictedPrice(
+                symbol: _stockSymbol,
+                currentPrice: currentPrice,
+                modelPredictedPrice: prediction.predictedPrice!,
+                quote: _quote,
+              )
+            : null;
+    final double? priceToShow = displayPredictedPrice ?? prediction?.predictedPrice;
+
     final dropdownValue =
     _selectedInterval != null &&
         intervalLabels.contains(_selectedInterval!.label)
@@ -214,15 +343,19 @@ class _AnalysispageState extends State<Analysispage> {
       appBar: AppBar(
         backgroundColor: Colors.blueAccent.shade700,
         title: searching
-            ? const TextField(
-          autofocus: false,
-          style: TextStyle(color: Colors.white),
-          decoration: InputDecoration(
-            hintText: "Search stocks...",
-            hintStyle: TextStyle(color: Colors.white70),
-            border: InputBorder.none,
-          ),
-        )
+            ? TextField(
+                controller: _searchController,
+                focusNode: _searchFocusNode,
+                textInputAction: TextInputAction.search,
+                style: const TextStyle(color: Colors.white),
+                cursorColor: Colors.white,
+                decoration: const InputDecoration(
+                  hintText: 'Search stocks...',
+                  hintStyle: TextStyle(color: Colors.white70),
+                  border: InputBorder.none,
+                ),
+                onSubmitted: (_) => _submitSearch(),
+              )
             : Row(
           children: [
             const Expanded(
@@ -254,11 +387,16 @@ class _AnalysispageState extends State<Analysispage> {
           ],
         ),
         actions: [
+          if (searching)
+            IconButton(
+              icon: const Icon(Icons.check),
+              tooltip: 'Search',
+              onPressed: _submitSearch,
+            ),
           IconButton(
             icon: Icon(searching ? Icons.close : Icons.search),
-            onPressed: () {
-              setState(() => searching = !searching);
-            },
+            tooltip: searching ? 'Close search' : 'Search',
+            onPressed: _toggleSearchMode,
           ),
         ],
       ),
@@ -349,7 +487,7 @@ class _AnalysispageState extends State<Analysispage> {
                         ],
                       ),
                       const SizedBox(height: 12),
-                      if (_analysis != null)
+                      if (_showAnalysisDebugMessages && _analysis != null)
                         Wrap(
                           children: [
                             if (_analysis!.isDemo)
@@ -390,11 +528,9 @@ class _AnalysispageState extends State<Analysispage> {
                                 crossAxisAlignment:
                                 CrossAxisAlignment.start,
                                 children: [
-                                  if (prediction != null &&
-                                      prediction.predictedPrice != null &&
-                                      prediction.predictedPrice! > 0)
+                                  if (priceToShow != null && priceToShow > 0)
                                     Text(
-                                      "\$${prediction.predictedPrice!.toStringAsFixed(2)}",
+                                      "\$${priceToShow.toStringAsFixed(2)}",
                                       style: const TextStyle(
                                         fontSize: 30,
                                         fontWeight: FontWeight.bold,
@@ -419,6 +555,17 @@ class _AnalysispageState extends State<Analysispage> {
                                     ),
                                     overflow: TextOverflow.ellipsis,
                                   ),
+                                  if (displayPredictedPrice != null)
+                                    const Padding(
+                                      padding: EdgeInsets.only(top: 4),
+                                      child: Text(
+                                        "Momentum & sector tilt applied (same as home Top Predictions).",
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          color: Colors.white38,
+                                        ),
+                                      ),
+                                    ),
                                   if (_analysis != null &&
                                       _analysis!.correlationUsed != null)
                                     Padding(
@@ -494,7 +641,9 @@ class _AnalysispageState extends State<Analysispage> {
                           ),
                         ],
                       ),
-                      if (_analysis != null && _analysis!.isDemo)
+                      if (_showAnalysisDebugMessages &&
+                          _analysis != null &&
+                          _analysis!.isDemo)
                         Padding(
                           padding: const EdgeInsets.only(top: 8),
                           child: Text(
@@ -505,7 +654,8 @@ class _AnalysispageState extends State<Analysispage> {
                             ),
                           ),
                         ),
-                      if (_analysis != null &&
+                      if (_showAnalysisDebugMessages &&
+                          _analysis != null &&
                           _analysis!.insufficientNews &&
                           !_analysis!.isDemo)
                         const Padding(
@@ -518,7 +668,8 @@ class _AnalysispageState extends State<Analysispage> {
                             ),
                           ),
                         ),
-                      if (_analysis != null &&
+                      if (_showAnalysisDebugMessages &&
+                          _analysis != null &&
                           _analysis!.isFallbackPrediction &&
                           !_analysis!.isDemo)
                         const Padding(
@@ -531,7 +682,8 @@ class _AnalysispageState extends State<Analysispage> {
                             ),
                           ),
                         ),
-                      if (!_sentimentService.isConfigured)
+                      if (_showAnalysisDebugMessages &&
+                          !_sentimentService.isConfigured)
                         Padding(
                           padding: const EdgeInsets.only(top: 12),
                           child: Text(
